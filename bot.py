@@ -1,55 +1,64 @@
 import os
 import time
+import base64
+import threading
+
 import requests
 from dotenv import load_dotenv
 
 from flask import Flask
-import threading
 
-# --------------------------------------------------
-# Flask: чтобы Render видел, что сервис жив
-# --------------------------------------------------
+# ----------------- Flask для Render (проверка живости) -----------------
 
 app = Flask(__name__)
+
 
 @app.route("/")
 def index():
     return "Bot is running"
 
+
 def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# Запускаем Flask в отдельном потоке
-threading.Thread(target=run_web, daemon=True).start()
 
-# --------------------------------------------------
-# Настройки бота и OpenAI
-# --------------------------------------------------
+# ----------------- Настройки и ключи -----------------
 
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")  # добавь в .env и на Render
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_STT_URL = "https://api.openai.com/v1/audio/transcriptions"
 
-# Режимы по чатам: "text" или "image"
-user_modes = {}  # {chat_id: "text" | "image"}
+# Пример эндпоинта для Imagen 3: обязательно проверь актуальный в доках Gemini
+GEMINI_IMAGE_URL = (
+    "https://generativelanguage.googleapis.com/v1beta/models/"
+    "imagen-3.0-generate-001:generateImage"
+)
 
-# --------------------------------------------------
-# Вспомогательные функции для Telegram
-# --------------------------------------------------
+# Лимит Телеги – 4096, берем запас
+MAX_MESSAGE_LENGTH = 3800
+
+# Режимы по чатам: "text" или "image"
+chat_modes = {}  # {chat_id: "text" | "image"}
+
+
+# ----------------- Вспомогательные функции Telegram -----------------
+
 
 def get_updates(offset=None):
     params = {"timeout": 20}
     if offset is not None:
         params["offset"] = offset
     try:
-        r = requests.get(f"{TG_API}/getUpdates", params=params)
+        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=30)
         data = r.json()
         return data.get("result", [])
     except Exception as e:
@@ -57,21 +66,46 @@ def get_updates(offset=None):
         return []
 
 
-def send_message(chat_id, text, reply_markup=None):
-    """Отправка сообщения, при необходимости с клавиатурой."""
-    try:
-        payload = {
-            "chat_id": chat_id,
-            "text": text,
-        }
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
+def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH):
+    """
+    Делим длинный текст на несколько сообщений, стараемся резать по строкам/пробелам.
+    """
+    if text is None:
+        return []
 
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json=payload,
-            timeout=10,
-        )
+    text = str(text)
+    parts = []
+
+    while len(text) > max_len:
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            split_at = text.rfind(" ", 0, max_len)
+            if split_at == -1:
+                split_at = max_len
+
+        parts.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+
+    if text:
+        parts.append(text)
+
+    return parts
+
+
+def send_message(chat_id, text, reply_markup=None):
+    try:
+        for part in split_message(text):
+            payload = {"chat_id": chat_id, "text": part}
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+                # клавиатуру отправляем только с первым сообщением
+                reply_markup = None
+
+            requests.post(
+                f"{TG_API}/sendMessage",
+                json=payload,
+                timeout=20,
+            )
     except Exception as e:
         print("Ошибка send_message:", e)
 
@@ -82,16 +116,46 @@ def send_typing(chat_id):
         requests.post(
             f"{TG_API}/sendChatAction",
             json={"chat_id": chat_id, "action": "typing"},
+            timeout=10,
         )
     except Exception as e:
         print("Ошибка send_typing:", e)
 
-# --------------------------------------------------
-# Работа с OpenAI: текст
-# --------------------------------------------------
 
-def ask_ai(text):
-    """Отправляем текст в OpenAI и получаем ответ."""
+def send_menu(chat_id):
+    """Клавиатура выбора режима: текст / картинки."""
+    keyboard = {
+        "keyboard": [
+            [
+                {"text": "💬 Текст"},
+                {"text": "🖼 Картинки"},
+            ]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False,
+    }
+    send_message(chat_id, "Выбери режим работы бота:", reply_markup=keyboard)
+
+
+# ----------------- OpenAI: текст и расшифровка голоса -----------------
+
+
+def ask_ai(user_text: str) -> str:
+    """
+    Отправляем текст в OpenAI и получаем ответ.
+    Внутри промпта говорим про лимит, но просим модель НЕ писать об этом.
+    """
+    prompt = (
+        "Ты отвечаешь пользователю в чате Telegram на русском языке. "
+        "Твой полный ответ вместе со всеми символами и форматированием "
+        "должен влезать в ограничение Telegram примерно 4000 символов. "
+        "Пиши по делу, структурированно, без лишней воды и без упоминаний "
+        "ограничения по длине сообщения или числа символов. "
+        "Не объясняй, что ты стараешься уместиться в лимит, просто делай это.\n\n"
+        "Сообщение пользователя:\n"
+        f"{user_text}"
+    )
+
     try:
         r = requests.post(
             OPENAI_CHAT_URL,
@@ -101,42 +165,29 @@ def ask_ai(text):
             },
             json={
                 "model": "gpt-4o-mini",
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": (
-                            "Ты дружелюбный русскоязычный ассистент. "
-                            "Отвечай понятно, красиво и по существу. "
-                            "Не упоминай никаких лимитов, символов, правил и ограничений. "
-                            "Просто формируй ответ так, чтобы он полностью умещался "
-                            "в сообщении Telegram примерно до 4000 символов."
-                        ),
-                    },
-                    {"role": "user", "content": text},
-                ],
-                # Лимит токенов: чтобы модель не раздувалась
-                "max_tokens": 3500,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 700,
             },
+            timeout=60,
         )
         data = r.json()
         return data["choices"][0]["message"]["content"]
     except Exception as e:
         print("Ошибка ask_ai:", e)
-        return "Что то пошло не так при обращении к ИИ."
+        return "Что-то пошло не так при обращении к ИИ."
 
-# --------------------------------------------------
-# Голос: скачивание и распознавание
-# --------------------------------------------------
 
 def download_file(file_id):
     """Скачиваем голосовое по file_id и возвращаем байты."""
     try:
-        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id})
+        r = requests.get(
+            f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20
+        )
         file_data = r.json()
         file_path = file_data["result"]["file_path"]
 
         file_url = f"{TG_FILE_API}/{file_path}"
-        file_resp = requests.get(file_url)
+        file_resp = requests.get(file_url, timeout=60)
         return file_resp.content
     except Exception as e:
         print("Ошибка download_file:", e)
@@ -147,7 +198,7 @@ def transcribe_audio(audio_bytes):
     """Отправляем аудио в OpenAI Whisper и получаем текст."""
     try:
         files = {
-            "file": ("audio.ogg", audio_bytes, "audio/ogg")
+            "file": ("audio.ogg", audio_bytes, "audio/ogg"),
         }
         data = {
             "model": "whisper-1",
@@ -157,11 +208,10 @@ def transcribe_audio(audio_bytes):
 
         r = requests.post(
             OPENAI_STT_URL,
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-            },
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             files=files,
             data=data,
+            timeout=120,
         )
 
         print("STT статус:", r.status_code)
@@ -176,26 +226,90 @@ def transcribe_audio(audio_bytes):
         print("Ошибка transcribe_audio:", e)
         return None
 
-# --------------------------------------------------
-# Основная логика бота
-# --------------------------------------------------
 
-def get_main_keyboard():
-    """Клавиатура с режимами."""
-    return {
-        "keyboard": [
-            [
-                {"text": "💬 Текст"},
-                {"text": "🖼 Картинки"},
-            ]
-        ],
-        "resize_keyboard": True,
-        "one_time_keyboard": False,
-    }
+# ----------------- Gemini: генерация картинок -----------------
+
+
+def generate_image_bytes(prompt: str):
+    """
+    Генерация картинки через Gemini / Imagen.
+
+    ВАЖНО:
+    1: эндпоинт и формат ответа могут меняться:
+       обязательно сверяй с актуальной документацией Google AI Studio.
+    2: если структура другая – смотри r.text в логах и поправь ключи.
+    """
+    if not GEMINI_API_KEY:
+        print("GEMINI_API_KEY не задан")
+        return None
+
+    try:
+        r = requests.post(
+            GEMINI_IMAGE_URL,
+            params={"key": GEMINI_API_KEY},
+            json={
+                "prompt": {"text": prompt},
+                # можно добавить другие настройки: размер, количество, и т.д.
+            },
+            timeout=120,
+        )
+        print("Gemini image status:", r.status_code)
+        print("Gemini image raw response:", r.text[:500])
+
+        if r.status_code != 200:
+            return None
+
+        data = r.json()
+        # примерная структура: { "images": [ { "bytesBase64Encoded": "..." } ] }
+        images = data.get("images") or []
+        if not images:
+            return None
+
+        b64 = images[0].get("bytesBase64Encoded")
+        if not b64:
+            return None
+
+        return base64.b64decode(b64)
+
+    except Exception as e:
+        print("Ошибка generate_image_bytes:", e)
+        return None
+
+
+def send_image(chat_id, prompt: str):
+    """
+    Генерируем картинку и отправляем её как фото.
+    """
+    img_bytes = generate_image_bytes(prompt)
+    if not img_bytes:
+        send_message(
+            chat_id,
+            "Не удалось сгенерировать изображение. "
+            "Проверь ключ Gemini и структуру ответа API.",
+        )
+        return
+
+    try:
+        files = {"photo": ("image.png", img_bytes)}
+        requests.post(
+            f"{TG_API}/sendPhoto",
+            data={"chat_id": chat_id},
+            files=files,
+            timeout=60,
+        )
+    except Exception as e:
+        print("Ошибка send_image:", e)
+        send_message(chat_id, "Картинку сгенерировала, но не смогла отправить 😢")
+
+
+# ----------------- Основной цикл бота -----------------
 
 
 def main():
-    print("Бот запущен: принимает текст и голосовые, показывает 'печатает'.")
+    print(
+        "Бот запущен: принимает текст и голос, показывает typing. "
+        "Есть режим чата и режим генерации картинок."
+    )
 
     offset = None
 
@@ -210,71 +324,61 @@ def main():
             if not message:
                 continue
 
-            chat = message.get("chat", {})
-            chat_id = chat.get("id")
-            if not chat_id:
-                continue
-
+            chat_id = message["chat"]["id"]
             text = message.get("text")
             voice = message.get("voice")
 
             print("Сообщение:", chat_id, "text:", text, "voice:", bool(voice))
 
-            # ----------------------------------------
-            # /start: привет и показ меню
-            # ----------------------------------------
+            # /start
             if text and text.startswith("/start"):
-                user_modes[chat_id] = "text"
-                kb = get_main_keyboard()
+                chat_modes[chat_id] = "text"
+                hello = (
+                    "Привет: я твой ИИ-бот CTRL+ART 💜\n\n"
+                    "Я умею:\n"
+                    "• общаться в текстовом режиме;\n"
+                    "• расшифровывать голосовые и отвечать на них;\n"
+                    "• генерировать картинки через Gemini (по описанию).\n\n"
+                    "Выбери ниже режим работы:"
+                )
+                send_menu(chat_id)
+                send_message(chat_id, hello)
+                continue
+
+            # Переключение режимов клавиатурой
+            if text in ("💬 Текст", "Текст"):
+                chat_modes[chat_id] = "text"
+                send_message(chat_id, "Готова болтать в текстовом режиме 💬")
+                continue
+
+            if text in ("🖼 Картинки", "Картинки"):
+                chat_modes[chat_id] = "image"
                 send_message(
                     chat_id,
-                    "Привет: я твой ИИ бот CTRL+ART 💜\n"
-                    "Я умею отвечать на текст и голосовые сообщения.\n"
-                    "Ниже есть меню: выбери режим работы.",
-                    reply_markup=kb,
+                    "Сейчас включён режим генерации картинок 🖼\n"
+                    "Опиши, что нужно нарисовать, как для промпта.",
                 )
                 continue
 
-            # ----------------------------------------
-            # Нажатия по кнопкам меню
-            # ----------------------------------------
-            if text == "💬 Текст":
-                user_modes[chat_id] = "text"
-                kb = get_main_keyboard()
-                send_message(
-                    chat_id,
-                    "Готов болтать в текстовом режиме 💬",
-                    reply_markup=kb,
-                )
-                continue
+            # Режим по умолчанию
+            mode = chat_modes.get(chat_id, "text")
 
-            if text == "🖼 Картинки":
-                user_modes[chat_id] = "image"
-                kb = get_main_keyboard()
-                send_message(
-                    chat_id,
-                    "Режим генерации картинок включен 🖼\n"
-                    "Пока что я ещё не подключен к Gemini, но меню уже работает.",
-                    reply_markup=kb,
-                )
-                continue
-
-            # Узнаем текущий режим для чата
-            mode = user_modes.get(chat_id, "text")
-
-            # ----------------------------------------
-            # Голосовое сообщение: пока в любом режиме
-            # ----------------------------------------
+            # Голос всегда расшифровываем и отвечаем текстом
             if voice:
                 send_typing(chat_id)
 
                 file_id = voice["file_id"]
                 audio_bytes = download_file(file_id)
 
-                print("Размер аудио:", 0 if audio_bytes is None else len(audio_bytes))
+                print(
+                    "Размер аудио:",
+                    0 if audio_bytes is None else len(audio_bytes),
+                )
 
                 if not audio_bytes:
-                    send_message(chat_id, "Не смог скачать голосовое сообщение 😢")
+                    send_message(
+                        chat_id, "Не смогла скачать голосовое сообщение 😢"
+                    )
                     continue
 
                 transcript = transcribe_audio(audio_bytes)
@@ -291,27 +395,27 @@ def main():
                 )
                 continue
 
-            # ----------------------------------------
             # Обычный текст
-            # ----------------------------------------
             if text:
-                # Режим картинок: пока просто заглушка
+                # Режим картинок
                 if mode == "image":
-                    send_message(
-                        chat_id,
-                        "Сейчас включен режим генерации картинок 🖼\n"
-                        "Чуть позже я подключу сюда Gemini и буду рисовать по твоим описаниям 💜",
-                    )
-                    continue
-
-                # Режим текста
-                send_typing(chat_id)
-                ai_answer = ask_ai(text)
-                send_message(chat_id, ai_answer)
-                continue
+                    send_typing(chat_id)
+                    send_image(chat_id, text)
+                else:
+                    # Режим чата
+                    send_typing(chat_id)
+                    ai_answer = ask_ai(text)
+                    send_message(chat_id, ai_answer)
 
         time.sleep(1)
 
 
+# ----------------- Точка входа -----------------
+
 if __name__ == "__main__":
+    # Запускаем Flask в отдельном потоке для Render
+    t = threading.Thread(target=run_web, daemon=True)
+    t.start()
+
+    # Основной цикл бота
     main()
