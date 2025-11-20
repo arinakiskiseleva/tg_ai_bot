@@ -2,6 +2,8 @@ import os
 import time
 import requests
 from dotenv import load_dotenv
+from flask import Flask
+import threading
 
 load_dotenv()
 
@@ -12,6 +14,17 @@ TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_STT_URL = "https://api.openai.com/v1/audio/transcriptions"
+
+# мини веб сервер для Render
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Bot is running"
+
+def run_web():
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
 
 
 def get_updates(offset=None):
@@ -32,7 +45,7 @@ MAX_MESSAGE_LENGTH = 3800  # запас до лимита телеги 4096 си
 
 def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH):
     """
-    Делим длинный текст на несколько сообщений, стараемся резать по строкам/пробелам.
+    Делим длинный текст на несколько сообщений, стараемся резать по строкам или пробелам.
     """
     if text is None:
         return []
@@ -71,7 +84,6 @@ def send_message(chat_id, text):
         print("Ошибка send_message:", e)
 
 
-
 def send_typing(chat_id):
     """Показываем 'бот печатает...'."""
     try:
@@ -108,12 +120,10 @@ def ask_ai(text):
 def download_file(file_id):
     """Скачиваем голосовое по file_id и возвращаем байты."""
     try:
-        # 1: узнаём путь к файлу
         r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id})
         file_data = r.json()
         file_path = file_data["result"]["file_path"]
 
-        # 2: качаем файл
         file_url = f"{TG_FILE_API}/{file_path}"
         file_resp = requests.get(file_url)
         return file_resp.content
@@ -178,7 +188,7 @@ def main():
 
             print("Сообщение:", chat_id, "text:", text, "voice:", bool(voice))
 
-            # /start
+            # команда /start
             if text and text.startswith("/start"):
                 send_message(
                     chat_id,
@@ -187,7 +197,7 @@ def main():
                 )
                 continue
 
-            # Голосовое
+            # голосовое
             if voice:
                 send_typing(chat_id)
 
@@ -214,7 +224,7 @@ def main():
                 )
                 continue
 
-            # Обычный текст
+            # обычный текст
             if text:
                 send_typing(chat_id)
                 ai_answer = ask_ai(text)
@@ -224,5 +234,7 @@ def main():
 
 
 if __name__ == "__main__":
-
+    # мини веб сервер для Render, чтобы он видел порт
+    threading.Thread(target=run_web, daemon=True).start()
+    # запускаем бота
     main()
