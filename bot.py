@@ -27,14 +27,49 @@ def get_updates(offset=None):
         return []
 
 
+MAX_MESSAGE_LENGTH = 3800  # запас до лимита телеги 4096 символов
+
+
+def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH):
+    """
+    Делим длинный текст на несколько сообщений, стараемся резать по строкам/пробелам.
+    """
+    if text is None:
+        return []
+
+    text = str(text)
+    parts = []
+
+    while len(text) > max_len:
+        # пробуем резать по переводу строки
+        split_at = text.rfind("\n", 0, max_len)
+        if split_at == -1:
+            # если нет перевода строки: режем по пробелу
+            split_at = text.rfind(" ", 0, max_len)
+            if split_at == -1:
+                # вообще нет пробелов: режем как есть
+                split_at = max_len
+
+        parts.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip()
+
+    if text:
+        parts.append(text)
+
+    return parts
+
+
 def send_message(chat_id, text):
     try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text},
-        )
+        for part in split_message(text):
+            requests.post(
+                f"{TG_API}/sendMessage",
+                json={"chat_id": chat_id, "text": part},
+                timeout=10,
+            )
     except Exception as e:
         print("Ошибка send_message:", e)
+
 
 
 def send_typing(chat_id):
@@ -189,4 +224,5 @@ def main():
 
 
 if __name__ == "__main__":
+
     main()
