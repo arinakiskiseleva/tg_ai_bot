@@ -1,12 +1,14 @@
 import os
 import time
+import json
+import re
+import base64
 import threading
 import requests
 from dotenv import load_dotenv
 from flask import Flask
 
-# ----------------------- Flask для Render -----------------------
-
+# -------------------- Flask keep-alive for Render --------------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -17,217 +19,82 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# ----------------------- Настройки и токены ----------------------
-
+# -------------------- Load env --------------------
 load_dotenv()
-
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
+TG_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
+
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+OPENAI_IMG_URL = "https://api.openai.com/v1/images/generations"
 
-# Лимит телеги 4096, оставим запас
-MAX_MESSAGE_LENGTH = 3800
+MODEL_TEXT_VISION = "gpt-4o-mini"
+MODEL_IMAGE = "gpt-image-1"
 
-# Кнопки меню
-BTN_MAIN = "💾 Основной чат"
-BTN_TEMP = "⏳ Временный чат"
-BTN_PSY = "🧠 Психолог"
-BTN_SMM = "📣 SMM-маркетолог"
-BTN_ASSIST = "📝 Личный ассистент"
+MAX_TG_CHARS = 4000
 
-# ----------------------- Память по пользователям -----------------
+# -------------------- Memory (JSON) --------------------
+MEMORY_FILE = "memory.json"
 
-# структура:
-# user_state[chat_id] = {
-#     "mode": "main" | "temp",
-#     "role": "default" | "psychologist" | "smm" | "assistant",
-#     "history": [ {"role": "user"/"assistant", "content": "..."} ]
+def load_memory():
+    if not os.path.exists(MEMORY_FILE):
+        return {}
+    try:
+        with open(MEMORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_memory(mem):
+    try:
+        with open(MEMORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(mem, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print("Ошибка save_memory:", e)
+
+memory_store = load_memory()
+
+# Структура:
+# memory_store[user_id] = {
+#   "facts": [{"text":"...", "tags":["..."], "topic":"..."}],
+#   "history": [{"role":"user","content":"..."},{"role":"assistant","content":"..."}]
 # }
-user_state = {}
 
+def get_user_block(user_id: str):
+    if user_id not in memory_store:
+        memory_store[user_id] = {"facts": [], "history": []}
+    return memory_store[user_id]
 
-def get_user_state(chat_id: int):
-    if chat_id not in user_state:
-        user_state[chat_id] = {
-            "mode": "main",
-            "role": "default",
-            "history": [],
-        }
-    return user_state[chat_id]
+def dedup_facts(facts):
+    seen = set()
+    out = []
+    for f in facts:
+        key = f.get("text","").strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(f)
+    return out
 
-# ----------------------- Вспомогательные функции -----------------
-
-
-def get_main_keyboard():
-    """Клавиатура с режимами."""
-    return {
-        "keyboard": [
-            [
-                {"text": BTN_MAIN},
-                {"text": BTN_TEMP},
-            ],
-            [
-                {"text": BTN_PSY},
-                {"text": BTN_SMM},
-                {"text": BTN_ASSIST},
-            ],
-        ],
-        "resize_keyboard": True,
-    }
-
-
-def clean_markdown(text: str) -> str:
+def extract_memory_items(user_text: str, ai_text: str):
     """
-    Убираем заголовки вида ###, ##, # и превращаем их в *жирный текст*,
-    чтобы в Телеге не торчали решётки, а всё выглядело аккуратно.
+    Умная память: просим модель вытащить важные факты о пользователе.
+    Возвращаем список фактов.
     """
-    lines = []
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped.startswith("### "):
-            title = stripped[4:]
-            lines.append(f"*{title}*")
-        elif stripped.startswith("## "):
-            title = stripped[3:]
-            lines.append(f"*{title}*")
-        elif stripped.startswith("# "):
-            title = stripped[2:]
-            lines.append(f"*{title}*")
-        else:
-            lines.append(line)
-    return "\n".join(lines)
-
-
-def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH):
-    """
-    Делим длинный текст на несколько сообщений, стараясь резать по строкам/пробелам.
-    """
-    if text is None:
-        return []
-
-    text = str(text)
-    parts = []
-
-    while len(text) > max_len:
-        split_at = text.rfind("\n", 0, max_len)
-        if split_at == -1:
-            split_at = text.rfind(" ", 0, max_len)
-            if split_at == -1:
-                split_at = max_len
-
-        parts.append(text[:split_at].rstrip())
-        text = text[split_at:].lstrip()
-
-    if text:
-        parts.append(text)
-
-    return parts
-
-
-def send_message(chat_id, text, reply_markup=None):
-    try:
-        text = clean_markdown(text)
-        for part in split_message(text):
-            payload = {
-                "chat_id": chat_id,
-                "text": part,
-                "parse_mode": "Markdown",  # простой markdown без v2
-            }
-            if reply_markup is not None:
-                payload["reply_markup"] = reply_markup
-
-            requests.post(
-                f"{TG_API}/sendMessage",
-                json=payload,
-                timeout=10,
-            )
-    except Exception as e:
-        print("Ошибка send_message:", e)
-
-
-def send_typing(chat_id):
-    """Показываем 'бот печатает...'."""
-    try:
-        requests.post(
-            f"{TG_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"},
-            timeout=5,
-        )
-    except Exception as e:
-        print("Ошибка send_typing:", e)
-
-
-def get_updates(offset=None):
-    params = {"timeout": 20}
-    if offset is not None:
-        params["offset"] = offset
-    try:
-        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=30)
-        data = r.json()
-        return data.get("result", [])
-    except Exception as e:
-        print("Ошибка get_updates:", e)
-        return []
-
-
-# ----------------------- OpenAI: генерация ответа -----------------
-
-
-def build_system_prompt(state):
-    base_parts = [
-        "Ты дружелюбный ИИ-бот CTRL+ART AI в Телеграме.",
-        "Отвечай на русском языке.",
-        "Пиши живо и понятно, без канцелярита и без грубостей.",
-        "Укладывайся примерно в 3500 символов, чтобы сообщение помещалось в ограничения Телеграма. Не упоминай это ограничение в ответе.",
-        "Используй простое оформление в стиле Telegram Markdown: списки через '-', нумерованные пункты '1.', 2., и выделение важного *жирным* или _курсивом_.",
-        "Не используй заголовки с символами '#' или '###', просто делай строку с *жирным текстом* вместо них.",
-    ]
-
-    role = state.get("role", "default")
-
-    if role == "psychologist":
-        base_parts.append(
-            "Сейчас ты в режиме психолога: мягко поддерживаешь, задаёшь уточняющие вопросы, "
-            "помогаешь взглянуть на ситуацию с разных сторон. Не даёшь медицинских диагнозов "
-            "и не обещаешь чудес. Поощряешь заботу о себе и при необходимости рекомендуешь обратиться "
-            "к живому специалисту."
-        )
-    elif role == "smm":
-        base_parts.append(
-            "Сейчас ты в режиме SMM-маркетолога: помогаешь с текстами для соцсетей, сторис, "
-            "прогревами, продающими и прогревающими постами. Пишешь просто и понятно, учитываешь "
-            "целевую аудиторию и тон бренда."
-        )
-    elif role == "assistant":
-        base_parts.append(
-            "Сейчас ты в режиме личного ассистента: помогаешь с планированием, задачами, списками дел, "
-            "структурой проектов и организацией дня. Отвечаешь чётко и структурированно."
-        )
-    else:
-        base_parts.append(
-            "Ты универсальный помощник: можешь и поддержать, и подсказать по делам, и помочь с текстами."
-        )
-
-    return " ".join(base_parts)
-
-
-def ask_ai(chat_id: int, user_text: str) -> str:
-    state = get_user_state(chat_id)
-    system_prompt = build_system_prompt(state)
-
-    messages = [
-        {"role": "system", "content": system_prompt},
-    ]
-
-    # В основном чате добавляем кусочек истории
-    if state["mode"] == "main":
-        history = state.get("history", [])
-        # Берём последние 6 сообщений (user+assistant)
-        messages.extend(history[-6:])
-
-    messages.append({"role": "user", "content": user_text})
+    prompt = (
+        "Ты помощник, который извлекает ЗНАЧИМЫЕ факты о пользователе из диалога.\n"
+        "Верни JSON строго в таком виде:\n"
+        '{ "facts": [ { "text": "...", "tags": ["..."], "topic": "..." } ] }\n'
+        "Правила:\n"
+        "1) Добавляй только факты, которые полезны в будущем (предпочтения, цели, проекты, важные данные).\n"
+        "2) Не добавляй случайные мелочи.\n"
+        "3) tags: 1-3 коротких тега.\n"
+        "4) topic: одна тема.\n"
+        "5) Если нечего сохранять: верни facts: [].\n\n"
+        f"Сообщение пользователя:\n{user_text}\n\n"
+        f"Ответ ассистента:\n{ai_text}\n"
+    )
 
     try:
         r = requests.post(
@@ -237,88 +104,227 @@ def ask_ai(chat_id: int, user_text: str) -> str:
                 "Content-Type": "application/json",
             },
             json={
-                "model": "gpt-4o-mini",
-                "messages": messages,
-                # не слишком большой, чтобы не словить лишние токены
-                "max_tokens": 800,
+                "model": MODEL_TEXT_VISION,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 220,
+                "temperature": 0.2,
             },
-            timeout=60,
+            timeout=30
         )
         data = r.json()
-        answer = data["choices"][0]["message"]["content"]
+        raw = data["choices"][0]["message"]["content"]
+        raw = raw.strip()
 
-        # Обновляем историю только в основном чате
-        if state["mode"] == "main":
-            state["history"].append({"role": "user", "content": user_text})
-            state["history"].append({"role": "assistant", "content": answer})
-            # Ограничим историю, чтобы не разрасталась
-            if len(state["history"]) > 40:
-                state["history"] = state["history"][-40:]
+        # Иногда модель заворачивает в ```json ... ```
+        raw = re.sub(r"^```json\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
 
-        return answer
+        obj = json.loads(raw)
+        return obj.get("facts", [])
     except Exception as e:
-        print("Ошибка ask_ai:", e)
-        return "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз чуть позже."
+        print("Ошибка extract_memory_items:", e)
+        return []
 
-
-# ----------------------------- Main loop --------------------------
-
-
-def handle_mode_buttons(chat_id: int, text: str):
-    """Обрабатываем нажатия на кнопки режима/роли."""
-    state = get_user_state(chat_id)
-
-    if "Основной чат" in text:
-        state["mode"] = "main"
-        send_message(
-            chat_id,
-            "Режим памяти: основной чат с умной памятью включён 💾🧠",
-            reply_markup=get_main_keyboard(),
+# -------------------- Telegram helpers --------------------
+def send_typing(chat_id):
+    try:
+        requests.post(
+            f"{TG_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"},
+            timeout=10,
         )
-        return True
+    except Exception as e:
+        print("Ошибка send_typing:", e)
 
-    if "Временный чат" in text:
-        state["mode"] = "temp"
-        state["history"] = []
-        send_message(
-            chat_id,
-            "Режим памяти: временный чат без сохранения включён ⏳",
-            reply_markup=get_main_keyboard(),
+def send_message(chat_id, text, reply_markup=None):
+    """
+    Шлём HTML, чтобы не было ** и ###.
+    """
+    try:
+        if text is None:
+            text = ""
+        text = str(text)
+
+        # На всякий случай обрезаем в жёсткий максимум телеги
+        if len(text) > MAX_TG_CHARS:
+            text = text[:MAX_TG_CHARS - 3] + "..."
+
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True,
+        }
+        if reply_markup:
+            payload["reply_markup"] = reply_markup
+
+        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=15)
+    except Exception as e:
+        print("Ошибка send_message:", e)
+
+def send_photo(chat_id, image_bytes, caption=None):
+    try:
+        files = {"photo": ("image.png", image_bytes)}
+        data = {"chat_id": chat_id}
+        if caption:
+            # caption тоже HTML
+            if len(caption) > 900:
+                caption = caption[:900] + "..."
+            data["caption"] = caption
+            data["parse_mode"] = "HTML"
+        requests.post(f"{TG_API}/sendPhoto", data=data, files=files, timeout=60)
+    except Exception as e:
+        print("Ошибка send_photo:", e)
+
+def get_updates(offset=None):
+    params = {"timeout": 25}
+    if offset is not None:
+        params["offset"] = offset
+    try:
+        r = requests.get(f"{TG_API}/getUpdates", params=params, timeout=35)
+        data = r.json()
+        return data.get("result", [])
+    except Exception as e:
+        print("Ошибка get_updates:", e)
+        return []
+
+def download_tg_file(file_id):
+    try:
+        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20)
+        file_path = r.json()["result"]["file_path"]
+        file_url = f"{TG_FILE_API}/{file_path}"
+        file_resp = requests.get(file_url, timeout=30)
+        return file_resp.content, file_url
+    except Exception as e:
+        print("Ошибка download_tg_file:", e)
+        return None, None
+
+# -------------------- OpenAI text + vision --------------------
+SYSTEM_PROMPT = (
+    "Ты дружелюбный помощник. Отвечай по-русски.\n"
+    "Ответ должен быть полезным и тёплым.\n"
+    "Длина ответа: максимум 4000 символов.\n"
+    "ВАЖНО: не упоминай никаких лимитов и не говори про 4000 символов.\n"
+    "Форматируй ответ только HTML тегами Telegram: <b>, <i>, <u>, <s>, <code>, <pre>.\n"
+    "Не используй markdown: никаких **, ###, ```.\n"
+)
+
+def ask_ai_text(messages):
+    try:
+        r = requests.post(
+            OPENAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_TEXT_VISION,
+                "messages": messages,
+                "max_tokens": 700,
+                "temperature": 0.7,
+            },
+            timeout=40
         )
-        return True
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("Ошибка ask_ai_text:", e)
+        return "Что то пошло не так при обращении к ИИ 😢"
 
-    if "Психолог" in text:
-        state["role"] = "psychologist"
-        send_message(
-            chat_id,
-            "Режим: психолог. Можно выговориться, я поддержу и помогу посмотреть на ситуацию мягко 🧠",
-            reply_markup=get_main_keyboard(),
+def ask_ai_with_image(user_text, image_url):
+    try:
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [
+                {"type": "text", "text": user_text or "Опиши, что на изображении и что важно."},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ]}
+        ]
+
+        r = requests.post(
+            OPENAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_TEXT_VISION,
+                "messages": messages,
+                "max_tokens": 700,
+                "temperature": 0.6,
+            },
+            timeout=60
         )
-        return True
+        data = r.json()
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("Ошибка ask_ai_with_image:", e)
+        return "Не получилось проанализировать картинку 😿"
 
-    if "SMM" in text or "SMM-маркетолог" in text or "смм" in text.lower():
-        state["role"] = "smm"
-        send_message(
-            chat_id,
-            "Режим: SMM-маркетолог. Помогу с текстами, идеями для постов и сторис, прогревами и подачей 📣",
-            reply_markup=get_main_keyboard(),
+# -------------------- OpenAI image generation --------------------
+IMG_PREFIXES = ["/img ", "/image ", "картинка:", "нарисуй:", "сгенерируй картинку:"]
+
+def is_image_request(text: str):
+    if not text:
+        return False
+    t = text.strip().lower()
+    return any(t.startswith(p) for p in IMG_PREFIXES)
+
+def strip_image_prefix(text: str):
+    t = text.strip()
+    low = t.lower()
+    for p in IMG_PREFIXES:
+        if low.startswith(p):
+            return t[len(p):].strip()
+    return t
+
+def generate_image(prompt: str):
+    try:
+        r = requests.post(
+            OPENAI_IMG_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_IMAGE,
+                "prompt": prompt,
+                "size": "1024x1024",
+                "response_format": "b64_json",
+            },
+            timeout=90
         )
-        return True
+        data = r.json()
+        b64 = data["data"][0]["b64_json"]
+        return base64.b64decode(b64)
+    except Exception as e:
+        print("Ошибка generate_image:", e)
+        return None
 
-    if "Личный ассистент" in text:
-        state["role"] = "assistant"
-        send_message(
-            chat_id,
-            "Режим: личный ассистент. Помогу с планами, задачами и организацией 📝",
-            reply_markup=get_main_keyboard(),
-        )
-        return True
+# -------------------- Modes --------------------
+MODE_TEMP = "temp"
+MODE_MAIN = "main"
 
-    return False
+user_modes = {}  # user_id -> mode
 
+def set_mode(user_id, mode):
+    user_modes[user_id] = mode
 
+def get_mode(user_id):
+    return user_modes.get(user_id, MODE_TEMP)
+
+def main_menu():
+    return {
+        "keyboard": [
+            [{"text": "⏳ Временный чат"}, {"text": "💾 Основной чат"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+
+# -------------------- Main loop --------------------
 def main():
-    print("Бот запущен: текст, память и режимы психолог / SMM / ассистент.")
+    print("Бот запущен: текст, vision, gpt-image, 2 режима памяти.")
 
     offset = None
 
@@ -327,52 +333,134 @@ def main():
 
         for upd in updates:
             offset = upd["update_id"] + 1
-            print("Получен апдейт:", upd)
 
             message = upd.get("message")
             if not message:
                 continue
 
             chat_id = message["chat"]["id"]
-            text = message.get("text")
+            user_id = str(message["from"]["id"])
 
-            state = get_user_state(chat_id)
+            text = message.get("text")
+            photos = message.get("photo")
 
             # /start
             if text and text.startswith("/start"):
-                welcome = (
-                    "Привет: я твой ИИ-бот CTRL+ART 💜\n\n"
-                    "Я умею отвечать на текстовые сообщения и запоминать контекст в основном чате.\n"
-                    "Ниже есть меню с режимами: выбери, как мы сейчас работаем."
-                )
+                set_mode(user_id, MODE_TEMP)
                 send_message(
                     chat_id,
-                    welcome,
-                    reply_markup=get_main_keyboard(),
+                    "Привет, зая 💜\n"
+                    "Я твой ИИ бот. Выбери режим:\n"
+                    "⏳ Временный чат: без памяти.\n"
+                    "💾 Основной чат: с умной памятью.",
+                    reply_markup=main_menu()
                 )
                 continue
 
-            # Кнопки режимов
-            if text and handle_mode_buttons(chat_id, text):
+            # Переключение режима меню
+            if text == "⏳ Временный чат":
+                set_mode(user_id, MODE_TEMP)
+                send_message(chat_id, "Ок, включила временный чат: память не сохраняю 💜", reply_markup=main_menu())
                 continue
 
-            # Если нет текста (фото, стикер и т.п.) — пока просто отвечаем
-            if not text:
-                send_message(chat_id, "Пока я понимаю только текстовые сообщения 😊")
+            if text == "💾 Основной чат":
+                set_mode(user_id, MODE_MAIN)
+                send_message(chat_id, "Ок, включила основной чат: буду помнить важное 💾💜", reply_markup=main_menu())
                 continue
 
-            # Обычный текст: спрашиваем ИИ
-            send_typing(chat_id)
-            ai_answer = ask_ai(chat_id, text)
-            send_message(chat_id, ai_answer)
+            mode = get_mode(user_id)
+
+            # Если пришло фото: анализируем
+            if photos:
+                send_typing(chat_id)
+                best = photos[-1]
+                file_id = best["file_id"]
+                _, file_url = download_tg_file(file_id)
+                if not file_url:
+                    send_message(chat_id, "Не смогла скачать картинку 😿")
+                    continue
+
+                user_caption = message.get("caption") or ""
+                ai_answer = ask_ai_with_image(user_caption, file_url)
+
+                # В main режиме пишем в историю + память
+                if mode == MODE_MAIN:
+                    block = get_user_block(user_id)
+                    block["history"].append({"role": "user", "content": f"[image] {user_caption}".strip()})
+                    block["history"].append({"role": "assistant", "content": ai_answer})
+
+                    facts = extract_memory_items(user_caption, ai_answer)
+                    block["facts"].extend(facts)
+                    block["facts"] = dedup_facts(block["facts"])[-80:]
+
+                    block["history"] = block["history"][-20:]
+                    save_memory(memory_store)
+
+                send_message(chat_id, ai_answer, reply_markup=main_menu())
+                continue
+
+            # Если попросили картинку
+            if text and is_image_request(text):
+                prompt = strip_image_prefix(text)
+                if not prompt:
+                    send_message(chat_id, "Опиши, что рисовать, и я сделаю 💜", reply_markup=main_menu())
+                    continue
+
+                send_typing(chat_id)
+                img_bytes = generate_image(prompt)
+
+                if not img_bytes:
+                    send_message(chat_id, "Не получилось сгенерировать картинку 😿", reply_markup=main_menu())
+                    continue
+
+                send_photo(chat_id, img_bytes, caption="Готово 💜",)
+                continue
+
+            # Обычный текст
+            if text:
+                send_typing(chat_id)
+
+                messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+
+                if mode == MODE_MAIN:
+                    block = get_user_block(user_id)
+
+                    # Память фактов в системный контекст
+                    if block["facts"]:
+                        facts_text = "\n".join(
+                            [f"- {f['text']} (теги: {', '.join(f.get('tags', []))}, тема: {f.get('topic','')})"
+                             for f in block["facts"][-25:]]
+                        )
+                        messages.append({
+                            "role": "system",
+                            "content": "Вот что ты уже знаешь про пользователя:\n" + facts_text
+                        })
+
+                    # История диалога
+                    messages.extend(block["history"])
+
+                messages.append({"role": "user", "content": text})
+
+                ai_answer = ask_ai_text(messages)
+
+                if mode == MODE_MAIN:
+                    block = get_user_block(user_id)
+                    block["history"].append({"role": "user", "content": text})
+                    block["history"].append({"role": "assistant", "content": ai_answer})
+
+                    facts = extract_memory_items(text, ai_answer)
+                    block["facts"].extend(facts)
+                    block["facts"] = dedup_facts(block["facts"])[-80:]
+
+                    block["history"] = block["history"][-20:]
+                    save_memory(memory_store)
+
+                send_message(chat_id, ai_answer, reply_markup=main_menu())
 
         time.sleep(1)
 
-
+# -------------------- Entrypoint --------------------
 if __name__ == "__main__":
-    # Запускаем Flask в отдельном потоке для Render
-    web_thread = threading.Thread(target=run_web)
-    web_thread.daemon = True
+    web_thread = threading.Thread(target=run_web, daemon=True)
     web_thread.start()
-
     main()
