@@ -1,13 +1,16 @@
 import os
 import time
+import json
 import base64
+import sqlite3
 import threading
 import requests
 from dotenv import load_dotenv
 from flask import Flask
 
-# ---------- Flask для Render (проверка, что сервис живой) ----------
-
+# --------------------
+# Flask для Render (чтобы порт был открыт)
+# --------------------
 app = Flask(__name__)
 
 @app.route("/")
@@ -18,32 +21,308 @@ def run_web():
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
 
-# ---------- Загрузка настроек ----------
-
+# --------------------
+# ENV
+# --------------------
 load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
+# Текстовая модель. В API нет названия "5.1" как у ChatGPT в приложении,
+# поэтому ставим актуальную API модель. Если хочешь другую, задай OPENAI_MODEL в Render.
+MODEL_TEXT = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+MODEL_VISION = os.getenv("OPENAI_VISION_MODEL", MODEL_TEXT)
+
 TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 TG_FILE_API = f"https://api.telegram.org/file/bot{BOT_TOKEN}"
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
-TEXT_MODEL = "gpt-4o-mini"
+OPENAI_IMG_URL = "https://api.openai.com/v1/images/generations"
 
-# Лимит телеги 4096, берём запас
-MAX_MESSAGE_LENGTH = 3800
+MAX_TELEGRAM_LEN = 4000
 
+# --------------------
+# Память SQLite (только для основного чата)
+# --------------------
+DB_PATH = "memory.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            chat_id INTEGER,
+            item TEXT,
+            ts INTEGER
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def add_memory(chat_id: int, text: str):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO memories (chat_id, item, ts) VALUES (?, ?, ?)",
+        (chat_id, text, int(time.time()))
+    )
+    conn.commit()
+    conn.close()
+
+def get_memories(chat_id: int, limit: int = 30):
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT item FROM memories WHERE chat_id=? ORDER BY ts DESC LIMIT ?",
+        (chat_id, limit)
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows][::-1]
+
+init_db()
+
+# --------------------
+# Сервисные функции Telegram
+# --------------------
+def send_message(chat_id, text):
+    """
+    Отправка текста с HTML форматированием.
+    Модель просим писать HTML, поэтому ### и ** не прилетают.
+    """
+    try:
+        # телега иногда ругается на слишком длинное сообщение,
+        # но мы просим модель укладываться в лимит.
+        payload = {
+            "chat_id": chat_id,
+            "text": text[:MAX_TELEGRAM_LEN],
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        requests.post(f"{TG_API}/sendMessage", json=payload, timeout=20)
+    except Exception as e:
+        print("send_message error:", e)
+
+def send_typing(chat_id):
+    try:
+        requests.post(
+            f"{TG_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"},
+            timeout=10
+        )
+    except Exception as e:
+        print("send_typing error:", e)
+
+def send_menu(chat_id):
+    keyboard = {
+        "keyboard": [
+            [{"text": "⚡ Временный чат"}, {"text": "💾 Основной чат"}]
+        ],
+        "resize_keyboard": True,
+        "one_time_keyboard": False
+    }
+    send_message(
+        chat_id,
+        "Привет! Я твой ИИ бот CTRL+ART 💜\n"
+        "Выбери режим:\n"
+        "⚡ Временный чат: без памяти\n"
+        "💾 Основной чат: с умной памятью"
+    )
+    try:
+        requests.post(
+            f"{TG_API}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": "Выбери режим кнопкой ниже 👇",
+                "reply_markup": keyboard
+            },
+            timeout=20
+        )
+    except Exception as e:
+        print("send_menu error:", e)
+
+# --------------------
+# Работа с файлами Telegram (для фото)
+# --------------------
+def download_telegram_file(file_id: str):
+    try:
+        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=20)
+        file_path = r.json()["result"]["file_path"]
+        file_url = f"{TG_FILE_API}/{file_path}"
+        file_resp = requests.get(file_url, timeout=30)
+        return file_resp.content
+    except Exception as e:
+        print("download_telegram_file error:", e)
+        return None
+
+# --------------------
+# OpenAI: чат
+# --------------------
+SYSTEM_PROMPT_BASE = (
+    "Ты дружелюбный помощник. "
+    "Отвечай на русском. "
+    "Форматирование делай ТОЛЬКО в HTML, используй простые теги: "
+    "<b>, <i>, <code>, <pre>, <ul>, <ol>, <li>, <br>. "
+    "НЕ используй Markdown символы вроде ###, **, __, ```.\n"
+    f"Ответ делай так, чтобы он уместился максимум в {MAX_TELEGRAM_LEN} символов, "
+    "но НЕ упоминай про лимиты в тексте."
+)
+
+def ask_ai(user_text: str, memories: list | None = None):
+    try:
+        messages = [{"role": "system", "content": SYSTEM_PROMPT_BASE}]
+        if memories:
+            mem_block = "\n".join(f"- {m}" for m in memories)
+            messages.append({
+                "role": "system",
+                "content": f"Важные факты о пользователе:\n{mem_block}"
+            })
+        messages.append({"role": "user", "content": user_text})
+
+        r = requests.post(
+            OPENAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_TEXT,
+                "messages": messages,
+                "max_tokens": 900,
+            },
+            timeout=60
+        )
+        data = r.json()
+        if "error" in data:
+            print("OpenAI error:", data["error"])
+            return "Что то пошло не так при обращении к ИИ 😢"
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("ask_ai error:", e)
+        return "Что то пошло не так при обращении к ИИ 😢"
+
+# --------------------
+# OpenAI: анализ фото
+# --------------------
+def analyze_image(image_bytes: bytes, user_text: str = ""):
+    try:
+        b64 = base64.b64encode(image_bytes).decode("utf-8")
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT_BASE},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": f"Проанализируй фото. {user_text}".strip()},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}}
+                ]
+            }
+        ]
+
+        r = requests.post(
+            OPENAI_CHAT_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": MODEL_VISION,
+                "messages": messages,
+                "max_tokens": 900
+            },
+            timeout=60
+        )
+        data = r.json()
+        if "error" in data:
+            print("Vision error:", data["error"])
+            return "Не получилось проанализировать картинку 😢 Проверь, что у ключа есть доступ к Vision."
+        return data["choices"][0]["message"]["content"]
+    except Exception as e:
+        print("analyze_image error:", e)
+        return "Не получилось проанализировать картинку 😢"
+
+# --------------------
+# OpenAI: генерация картинки
+# --------------------
+def generate_image(prompt: str):
+    """
+    Возвращает bytes картинки (jpg/png).
+    """
+    try:
+        r = requests.post(
+            OPENAI_IMG_URL,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-image-1",
+                "prompt": prompt,
+                "size": "1024x1024"
+            },
+            timeout=120
+        )
+        data = r.json()
+        if "error" in data:
+            print("Image gen error:", data["error"])
+            return None
+
+        item = data["data"][0]
+
+        # чаще всего приходит b64_json
+        if "b64_json" in item and item["b64_json"]:
+            return base64.b64decode(item["b64_json"])
+
+        # иногда приходит url
+        if "url" in item and item["url"]:
+            img_resp = requests.get(item["url"], timeout=60)
+            return img_resp.content
+
+        return None
+    except Exception as e:
+        print("generate_image error:", e)
+        return None
+
+def send_photo(chat_id, image_bytes: bytes, caption: str = ""):
+    try:
+        files = {"photo": ("image.png", image_bytes)}
+        data = {"chat_id": chat_id, "caption": caption[:1024]}
+        requests.post(f"{TG_API}/sendPhoto", files=files, data=data, timeout=60)
+    except Exception as e:
+        print("send_photo error:", e)
+
+# --------------------
+# Автоопределение запроса на картинку
+# --------------------
+IMAGE_TRIGGERS = [
+    "сгенерируй", "генерируй", "нарисуй", "сделай картинку", "сделай изображение",
+    "создай изображение", "создай картинку", "хочу картинку", "хочу изображение",
+    "изобрази", "картинк", "изображен"
+]
+
+def is_image_request(text: str):
+    if not text:
+        return False
+    t = text.lower()
+    # отсекаем вопросы "умеешь ли" чтобы не срабатывало на болтовню
+    if "умеешь" in t and ("картинк" in t or "изображен" in t):
+        return False
+    return any(tr in t for tr in IMAGE_TRIGGERS)
+
+# --------------------
 # Режимы чата
-MODE_TEMP = "temp"
-MODE_MAIN = "main"
+# --------------------
+user_modes = {}  # chat_id -> "temp" | "main"
 
-# Память по пользователям
-chat_modes = {}       # chat_id -> MODE_TEMP / MODE_MAIN
-chat_histories = {}   # chat_id -> list[{"role":...,"content":...}]
+def set_mode(chat_id, mode):
+    user_modes[chat_id] = mode
 
-# ---------- Вспомогательные функции ----------
+def get_mode(chat_id):
+    return user_modes.get(chat_id, "temp")
 
+# --------------------
+# Updates loop
+# --------------------
 def get_updates(offset=None):
     params = {"timeout": 20}
     if offset is not None:
@@ -53,221 +332,14 @@ def get_updates(offset=None):
         data = r.json()
         return data.get("result", [])
     except Exception as e:
-        print("Ошибка get_updates:", e)
+        print("get_updates error:", e)
         return []
-
-
-def split_message(text: str, max_len: int = MAX_MESSAGE_LENGTH):
-    """Аккуратно режем длинный текст по строкам/пробелам."""
-    if text is None:
-        return []
-
-    text = str(text)
-    parts = []
-
-    while len(text) > max_len:
-        split_at = text.rfind("\n", 0, max_len)
-        if split_at == -1:
-            split_at = text.rfind(" ", 0, max_len)
-            if split_at == -1:
-                split_at = max_len
-
-        parts.append(text[:split_at].rstrip())
-        text = text[split_at:].lstrip()
-
-    if text:
-        parts.append(text)
-
-    return parts
-
-
-def clean_markdown(text: str) -> str:
-    """Убираем типичное markdown-оформление, чтобы не было ** и ###."""
-    if not isinstance(text, str):
-        return text
-
-    # Простые замены
-    for token in ["**", "__", "```", "`"]:
-        text = text.replace(token, "")
-
-    # Убираем ведущие # в заголовках
-    lines = text.splitlines()
-    cleaned = []
-    for line in lines:
-        stripped = line.lstrip()
-        while stripped.startswith("#"):
-            stripped = stripped[1:].lstrip()
-        cleaned.append(stripped)
-    return "\n".join(cleaned).strip()
-
-
-def send_message(chat_id, text):
-    try:
-        for part in split_message(text):
-            requests.post(
-                f"{TG_API}/sendMessage",
-                json={
-                    "chat_id": chat_id,
-                    "text": part,
-                    # без parse_mode, чтобы не было проблем с форматированием
-                },
-                timeout=10,
-            )
-    except Exception as e:
-        print("Ошибка send_message:", e)
-
-
-def send_typing(chat_id):
-    try:
-        requests.post(
-            f"{TG_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"},
-            timeout=5,
-        )
-    except Exception as e:
-        print("Ошибка send_typing:", e)
-
-
-def send_start_menu(chat_id):
-    """Приветствие и клавиатура с режимами."""
-    text = (
-        "Привет, я твой ИИ бот CTRL+ART 💜\n\n"
-        "Выбери режим:\n"
-        "⚡ Временный чат: без памяти.\n"
-        "💾 Основной чат: с умной памятью."
-    )
-
-    keyboard = {
-        "keyboard": [
-            [{"text": "⚡ Временный чат"}],
-            [{"text": "💾 Основной чат"}],
-        ],
-        "resize_keyboard": True,
-    }
-
-    try:
-        requests.post(
-            f"{TG_API}/sendMessage",
-            json={
-                "chat_id": chat_id,
-                "text": text,
-                "reply_markup": keyboard,
-            },
-            timeout=10,
-        )
-    except Exception as e:
-        print("Ошибка send_start_menu:", e)
-
-
-def download_file(file_id):
-    """Скачиваем файл по file_id (для картинок)."""
-    try:
-        r = requests.get(f"{TG_API}/getFile", params={"file_id": file_id}, timeout=10)
-        file_data = r.json()
-        file_path = file_data["result"]["file_path"]
-
-        file_url = f"{TG_FILE_API}/{file_path}"
-        file_resp = requests.get(file_url, timeout=20)
-        return file_resp.content
-    except Exception as e:
-        print("Ошибка download_file:", e)
-        return None
-
-
-SYSTEM_PROMPT = (
-    "Ты дружелюбный, но нейтральный помощник. Отвечай на русском языке.\n"
-    "Давай ответы структурированно, по делу, без лишней воды.\n"
-    "Ответ должен помещаться в пределах примерно 4000 символов, "
-    "но не упоминай это ограничение в тексте."
-)
-
-
-def ask_ai(user_text: str, mode: str, chat_id=None, image_bytes: bytes | None = None) -> str:
-    """Запрос к GPT-4o-mini. Умеет анализировать картинку, если image_bytes не None."""
-    try:
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-
-        # Добавляем историю для основного режима
-        if mode == MODE_MAIN and chat_id in chat_histories:
-            messages.extend(chat_histories[chat_id])
-
-        # Формируем контент пользователя
-        user_content = []
-
-        if user_text:
-            user_content.append({"type": "text", "text": user_text})
-
-        if image_bytes:
-            b64 = base64.b64encode(image_bytes).decode("utf-8")
-            data_url = f"data:image/jpeg;base64,{b64}"
-            user_content.append(
-                {
-                    "type": "image_url",
-                    "image_url": {"url": data_url},
-                }
-            )
-
-        if not user_content:
-            user_content = [{"type": "text", "text": "Просто ответь дружелюбно."}]
-
-        # Если только текст: можно отправить строкой, иначе массивом
-        if len(user_content) == 1 and user_content[0]["type"] == "text":
-            user_message = {"role": "user", "content": user_content[0]["text"]}
-        else:
-            user_message = {"role": "user", "content": user_content}
-
-        messages.append(user_message)
-
-        r = requests.post(
-            OPENAI_CHAT_URL,
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": TEXT_MODEL,
-                "messages": messages,
-                "max_tokens": 1000,
-            },
-            timeout=60,
-        )
-
-        data = r.json()
-        print("AI status:", r.status_code)
-        if r.status_code != 200:
-            print("AI error body:", data)
-            return "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
-
-        ai_content = data["choices"][0]["message"]["content"]
-
-        # Обновляем память только в основном режиме
-        if mode == MODE_MAIN and chat_id is not None:
-            history = chat_histories.get(chat_id, [])
-            history.append(user_message)
-            history.append({"role": "assistant", "content": ai_content})
-            # ограничиваем историю, чтобы не росла бесконечно
-            chat_histories[chat_id] = history[-12:]
-
-        return clean_markdown(ai_content)
-
-    except Exception as e:
-        print("Ошибка ask_ai:", e)
-        return "Что-то пошло не так при обращении к ИИ. Попробуй ещё раз."
-
-
-def get_mode(chat_id):
-    """Текущий режим пользователя (по умолчанию временный)."""
-    return chat_modes.get(chat_id, MODE_TEMP)
-
-
-def set_mode(chat_id, mode: str):
-    chat_modes[chat_id] = mode
-
-
-# ---------- Главный цикл ----------
 
 def main():
-    print("Бот запущен: текст, анализ картинок, два режима памяти.")
+    print("Bot started: text and images, two modes (temp/main).")
+
+    # Запускаем Flask в отдельном потоке
+    threading.Thread(target=run_web, daemon=True).start()
 
     offset = None
 
@@ -276,62 +348,81 @@ def main():
 
         for upd in updates:
             offset = upd["update_id"] + 1
-            print("Получен апдейт:", upd)
-
             message = upd.get("message")
             if not message:
                 continue
 
             chat_id = message["chat"]["id"]
-            text = message.get("text") or message.get("caption")
+            text = message.get("text", "")
             photos = message.get("photo")
 
-            # Команда /start
-            if text and text.startswith("/start"):
-                set_mode(chat_id, MODE_TEMP)
-                # обнуляем историю при новом старте
-                chat_histories.pop(chat_id, None)
-                send_start_menu(chat_id)
+            # /start
+            if text.startswith("/start"):
+                set_mode(chat_id, "temp")
+                send_menu(chat_id)
                 continue
 
-            # Нажатие на кнопки меню
+            # Кнопки режима
             if text == "⚡ Временный чат":
-                set_mode(chat_id, MODE_TEMP)
-                chat_histories.pop(chat_id, None)  # очищаем память
-                send_message(chat_id, "Ок, включён временный чат без памяти ⚡")
+                set_mode(chat_id, "temp")
+                send_message(chat_id, "Ок: включила временный чат. Память не сохраняю ⚡")
                 continue
 
             if text == "💾 Основной чат":
-                set_mode(chat_id, MODE_MAIN)
-                send_message(chat_id, "Ок, включила основной чат: буду помнить важное 💾")
+                set_mode(chat_id, "main")
+                send_message(chat_id, "Ок: включила основной чат. Буду помнить важное 💾💜")
                 continue
 
             mode = get_mode(chat_id)
 
-            # Обработка картинок
-            image_bytes = None
+            # Если прислали фото: анализ
             if photos:
-                # берём самую большую версию
-                file_id = photos[-1]["file_id"]
-                image_bytes = download_file(file_id)
-                if not text:
-                    text = "Проанализируй это изображение и расскажи, что на нём изображено."
+                send_typing(chat_id)
+                best = photos[-1]
+                file_id = best["file_id"]
+                img_bytes = download_telegram_file(file_id)
+                if not img_bytes:
+                    send_message(chat_id, "Не смогла скачать картинку 😢")
+                    continue
 
-            # Ничего содержательного
-            if not text and not image_bytes:
-                send_message(chat_id, "Отправь текст или картинку, и я отвечу.")
+                answer = analyze_image(img_bytes, user_text=text)
+                send_message(chat_id, answer)
+
+                # память только в основном
+                if mode == "main" and text:
+                    add_memory(chat_id, f"Пользователь прислал фото и написал: {text}")
                 continue
 
-            # Обычный запрос
-            send_typing(chat_id)
-            ai_answer = ask_ai(text, mode=mode, chat_id=chat_id, image_bytes=image_bytes)
-            send_message(chat_id, ai_answer)
+            # Авто генерация картинки по тексту
+            if text and is_image_request(text):
+                send_typing(chat_id)
+                img = generate_image(text)
+                if not img:
+                    send_message(
+                        chat_id,
+                        "Не удалось сгенерировать картинку 😢 "
+                        "Проверь, что ключ OpenAI с доступом к Images и включён биллинг."
+                    )
+                    continue
+
+                send_photo(chat_id, img, caption="Готово 💜")
+
+                if mode == "main":
+                    add_memory(chat_id, f"Запрос на картинку: {text}")
+                continue
+
+            # Обычный текстовый ответ
+            if text:
+                send_typing(chat_id)
+                memories = get_memories(chat_id) if mode == "main" else None
+                answer = ask_ai(text, memories=memories)
+                send_message(chat_id, answer)
+
+                if mode == "main":
+                    add_memory(chat_id, f"Пользователь: {text}")
+                continue
 
         time.sleep(1)
 
-
 if __name__ == "__main__":
-    # web-сервер для Render в отдельном потоке
-    threading.Thread(target=run_web, daemon=True).start()
-    # основной цикл бота
     main()
